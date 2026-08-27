@@ -1,0 +1,93 @@
+name: Custom CUDA build (windows-x64 + MMQ + ALL_QUANTS)
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_ref:
+        description: 'llama.cpp ref to build (branch, tag or commit)'
+        type: string
+        default: 'master'
+      cuda_version:
+        description: 'CUDA toolkit version'
+        type: choice
+        options: ['12.4', '13.3', '13.4']
+        default: '12.4'
+      arch:
+        description: 'Target architecture'
+        type: choice
+        options: ['x64', 'arm64']
+        default: 'x64'
+      cmake_flags:
+        description: 'Extra CMake flags (appended last = override built-ins)'
+        required: false
+        default: '-DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_FORCE_MMQ=ON -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_CCACHE=OFF -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=ON -DLLAMA_BUILD_TESTS=OFF'
+      build_target:
+        description: 'Build target (empty = all binaries)'
+        required: false
+        default: ''
+
+jobs:
+  cuda:
+    name: custom-cuda (${{ inputs.cuda_version }}, ${{ inputs.arch }})
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone llama.cpp
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ inputs.llama_ref }}
+          fetch-depth: 0 # full history so the build embeds a proper version string
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: custom-cuda-windows-${{ inputs.cuda_version }}-${{ inputs.arch }}
+
+      - name: Install Cuda Toolkit
+        uses: ggml-org/llama.cpp/.github/actions/windows-setup-cuda@master
+        with:
+          cuda_version: ${{ inputs.cuda_version }}
+          cuda_arch: ${{ inputs.arch }}
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Arm64 toolchain flag
+        if: inputs.arch == 'arm64'
+        shell: bash
+        run: echo "TOOLCHAIN_FLAG=-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake" >> "$GITHUB_ENV"
+
+      - name: CUDA 12 compat flag
+        if: startsWith(inputs.cuda_version, '12')
+        shell: bash
+        run: echo "CUDA_COMPAT_FLAG=-DGGML_CUDA_CUB_3DOT2=ON" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ inputs.arch == 'x64' && 'x64' || 'amd64_arm64' }}
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            ${{ env.TOOLCHAIN_FLAG }} ^
+            ${{ env.CUDA_COMPAT_FLAG }} ^
+            ${{ inputs.cmake_flags }}
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% ${{ inputs.build_target && format('--target {0}', inputs.build_target) || '' }}
+
+      - name: Bundle CUDA runtime DLLs
+        shell: pwsh
+        run: |
+          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ inputs.cuda_version }}\bin"
+          if (Test-Path $cudaBin) {
+            Copy-Item "$cudaBin\cudart64_*.dll","$cudaBin\cublas64_*.dll","$cudaBin\cublasLt64_*.dll" -Destination build/bin/Release -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: llama-custom-cuda-${{ inputs.cuda_version }}-${{ inputs.arch }}
+          path: build/bin/Release/
+          retention-days: 14
