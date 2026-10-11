@@ -1,0 +1,329 @@
+name: Custom Build (CUDA + Vulkan, Windows)
+
+# -----------------------------------------------------------------------------
+# What this workflow does:
+#   * Lets you pick the llama.cpp source:
+#       - bleeding-edge  : master branch (latest commit)
+#       - latest-tag     : automatically resolves the newest release tag at build time
+#       - custom-tag     : use the tag/commit you type into `llama_tag`
+#       - <tag> (date)   : a pre-populated list of recent releases (refresh periodically)
+#   * Lets you pick the backend:
+#       - cuda           : CUDA build (x64 or arm64, MMQ + ALL_QUANTS)
+#       - vulkan        : Vulkan build (x64 only, based on the official llama.cpp workflow)
+#       - both           : build both backends in parallel
+# -----------------------------------------------------------------------------
+
+on:
+  workflow_dispatch:
+    inputs:
+      llama_source:
+        description: 'What to build? bleeding-edge = master branch (latest commit); latest-tag = auto-fetch the newest release tag at build time; custom-tag = use the tag/branch/commit you enter in llama_tag below.'
+        type: choice
+        options:
+          - 'bleeding-edge (master, latest commit)'
+          - 'latest-tag (auto-fetch newest release at build time)'
+          - 'custom-tag (enter tag in llama_tag below)'
+        default: 'bleeding-edge (master, latest commit)'
+      llama_tag:
+        description: 'Used only when llama_source = custom-tag. Any tag, branch or commit SHA from https://github.com/ggml-org/llama.cpp/releases — e.g. b11552, b11500, master, 0a1b2c3d. Browse the releases page to find the tag/date you want, then paste the tag here. Ignored for the other two llama_source modes.'
+        required: false
+        default: ''
+      build_backend:
+        description: 'Backend to build. Vulkan is x64-only; CUDA supports x64 and arm64.'
+        type: choice
+        options:
+          - 'cuda'
+          - 'vulkan'
+          - 'both'
+        default: 'cuda'
+      cuda_version:
+        description: 'CUDA toolkit version (CUDA backend only)'
+        type: choice
+        options: ['12.4', '13.3', '13.4']
+        default: '12.4'
+      arch:
+        description: 'Target architecture (CUDA only; Vulkan always builds x64)'
+        type: choice
+        options: ['x64', 'arm64']
+        default: 'x64'
+      cuda_cmake_flags:
+        description: 'Extra CMake flags for CUDA build (appended last = override built-ins)'
+        required: false
+        default: '-DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_FORCE_MMQ=ON -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_CCACHE=OFF -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=ON -DLLAMA_BUILD_TESTS=OFF'
+      vulkan_cmake_flags:
+        description: 'CMake flags for Vulkan build. Mirrors cuda_cmake_flags where applicable: -DGGML_CUDA=ON -> -DGGML_VULKAN=ON; -DGGML_CUDA_FA_ALL_QUANTS=ON -> -DGGML_VULKAN_FA_ALL_QUANTS=ON; -DCMAKE_CUDA_ARCHITECTURES and -DGGML_CUDA_FORCE_MMQ have no Vulkan analog (SPIR-V is JIT at runtime; no MMQ kernel). All CPU/build flags (Release, NATIVE=OFF, SSE42/AVX/AVX2/FMA/F16C, CCACHE=OFF, SHARED_LIBS, CURL, NO_TESTS) are identical and included. Vulkan-only extras: explicit VULKAN_DEBUG/VALIDATE/PERF=OFF for a lean release build.'
+        required: false
+        default: '-DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_VULKAN_FA_ALL_QUANTS=ON -DGGML_VULKAN_DEBUG=OFF -DGGML_VULKAN_VALIDATE=OFF -DGGML_VULKAN_PERF=OFF -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_CCACHE=OFF -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=ON -DLLAMA_BUILD_TESTS=OFF'
+      build_target:
+        description: 'Build target (empty = all binaries)'
+        required: false
+        default: ''
+
+jobs:
+
+  # -----------------------------------------------------------------------------
+  # Resolve the llama.cpp git ref from the selected source.
+  # Outputs:
+  #   ref    : the actual git ref to checkout (master, bXXXXX, commit SHA, ...)
+  #   label  : a human-readable label for log lines and artifact names
+  # -----------------------------------------------------------------------------
+  resolve-ref:
+    name: Resolve llama.cpp ref
+    runs-on: ubuntu-latest
+    outputs:
+      ref: ${{ steps.parse.outputs.ref }}
+      label: ${{ steps.parse.outputs.label }}
+    steps:
+      - id: parse
+        shell: bash
+        run: |
+          set -eu
+          src="${{ inputs.llama_source }}"
+          case "$src" in
+            bleeding-edge*)
+              ref="master"
+              label="bleeding-edge"
+              ;;
+            latest-tag*)
+              echo "Fetching latest release tag from GitHub API..."
+              # Unauthenticated api.github.com calls from shared GitHub-hosted runner IPs
+              # are rate-limited (60/h) intermittently, which used to fail this job and
+              # skip every dependent job. Retry, then fall back to git ls-remote.
+              ref=""
+              for i in 1 2 3; do
+                echo "API attempt $i ..."
+                if ref="$(curl -fsSL --retry 2 -H 'Accept: application/vnd.github+json' \
+                  https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
+                  | python3 -c 'import sys,json;print(json.load(sys.stdin)["tag_name"])' 2>/dev/null)" \
+                   && [ -n "$ref" ]; then
+                  break
+                fi
+                ref=""
+                echo "Attempt $i failed (rate limit or transient network error); retrying in 10s ..."
+                sleep 10
+              done
+              # Fallback: llama.cpp release tags are 'b<build-number>' and monotonically
+              # increasing, so the numerically largest tag == newest release. No REST API
+              # involved, git protocol is not rate-limited this way.
+              if [ -z "$ref" ]; then
+                echo "::warning::GitHub API unavailable; resolving latest tag via git ls-remote"
+                ref="$(git ls-remote --tags --refs https://github.com/ggml-org/llama.cpp.git \
+                  | sed -nE 's#.*refs/tags/(b[0-9]+)$#\1#p' \
+                  | sort -V | tail -n1)"
+              fi
+              if [ -z "$ref" ]; then
+                echo "::error::Could not resolve the latest llama.cpp release tag (GitHub API and git ls-remote both failed). Re-run the workflow or use bleeding-edge/custom-tag instead." >&2
+                exit 1
+              fi
+              label="latest-tag($ref)"
+              ;;
+            custom-tag*)
+              ref="${{ inputs.llama_tag }}"
+              if [ -z "$ref" ]; then
+                echo "::error::llama_source=custom-tag but llama_tag is empty. Set llama_tag (browse https://github.com/ggml-org/llama.cpp/releases) or pick a different source." >&2
+                exit 1
+              fi
+              label="custom($ref)"
+              ;;
+            "")
+              # inputs.* is empty when the workflow is triggered by push/PR instead of
+              # workflow_dispatch: default to the same behavior as bleeding-edge instead
+              # of failing and skipping every dependent job.
+              echo "::warning::llama_source is empty (non-dispatch trigger or re-run without inputs); defaulting to bleeding-edge (master)."
+              ref="master"
+              label="bleeding-edge"
+              ;;
+            *)
+              echo "::error::Unknown llama_source value: '$src'. Expected bleeding-edge / latest-tag / custom-tag." >&2
+              exit 1
+              ;;
+          esac
+          echo "ref=$ref"      >> "$GITHUB_OUTPUT"
+          echo "label=$label"  >> "$GITHUB_OUTPUT"
+          echo "Resolved ref: $ref  (label: $label)"
+
+  # -----------------------------------------------------------------------------
+  # CUDA build job (unchanged logic, renamed cmake_flags -> cuda_cmake_flags)
+  # -----------------------------------------------------------------------------
+  cuda:
+    name: custom-cuda (${{ inputs.cuda_version }}, ${{ inputs.arch }}, ${{ needs.resolve-ref.outputs.label }})
+    needs: resolve-ref
+    if: inputs.build_backend == 'cuda' || inputs.build_backend == 'both'
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone llama.cpp (${{ needs.resolve-ref.outputs.label }})
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.resolve-ref.outputs.ref }}
+          fetch-depth: 0 # full history so the build embeds a proper version string
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: custom-cuda-windows-${{ inputs.cuda_version }}-${{ inputs.arch }}-${{ needs.resolve-ref.outputs.label }}
+
+      - name: Install Cuda Toolkit
+        uses: ggml-org/llama.cpp/.github/actions/windows-setup-cuda@master
+        with:
+          cuda_version: ${{ inputs.cuda_version }}
+          cuda_arch: ${{ inputs.arch }}
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Arm64 toolchain flag
+        if: inputs.arch == 'arm64'
+        shell: bash
+        run: echo "TOOLCHAIN_FLAG=-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake" >> "$GITHUB_ENV"
+
+      - name: CUDA 12 compat flag
+        if: startsWith(inputs.cuda_version, '12')
+        shell: bash
+        run: echo "CUDA_COMPAT_FLAG=-DGGML_CUDA_CUB_3DOT2=ON" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ inputs.arch == 'x64' && 'x64' || 'amd64_arm64' }}
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            ${{ env.TOOLCHAIN_FLAG }} ^
+            ${{ env.CUDA_COMPAT_FLAG }} ^
+            ${{ inputs.cuda_cmake_flags }}
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% ${{ inputs.build_target && format('--target {0}', inputs.build_target) || '' }}
+
+      - name: Bundle CUDA runtime DLLs
+        shell: pwsh
+        run: |
+          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ inputs.cuda_version }}\bin"
+          if (Test-Path $cudaBin) {
+            Copy-Item "$cudaBin\cudart64_*.dll","$cudaBin\cublas64_*.dll","$cudaBin\cublasLt64_*.dll" -Destination build/bin/Release -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-custom-cuda-${{ inputs.cuda_version }}-${{ inputs.arch }}-${{ needs.resolve-ref.outputs.label }}
+          path: build/bin/Release/
+          retention-days: 14
+
+  # -----------------------------------------------------------------------------
+  # Vulkan build job (Windows x64 only).
+  # Mirrors the official llama.cpp windows-vulkan-x64 workflow:
+  #   * LunarG Vulkan SDK installed silently to C:\VulkanSDK\<version>
+  #   * VULKAN_SDK env var + Bin on PATH
+  #   * CMake/Ninja Multi-Config + MSVC vcvarsall x64
+  #   * -DGGML_VULKAN=ON
+  #
+  # Flag mapping (CUDA -> Vulkan). Every CUDA flag that has an analog or that
+  # is shared across backends is mirrored here:
+  #   -DCMAKE_BUILD_TYPE=Release                -> identical
+  #   -DGGML_CUDA=ON                            -> -DGGML_VULKAN=ON
+  #   -DCMAKE_CUDA_ARCHITECTURES=75              -> (no analog; Vulkan SPIR-V is JIT'd to GPU arch at runtime)
+  #   -DGGML_CUDA_FA_ALL_QUANTS=ON              -> -DGGML_VULKAN_FA_ALL_QUANTS=ON
+  #   -DGGML_CUDA_FORCE_MMQ=ON                   -> (no analog; MMQ is a CUDA-only kernel)
+  #   -DGGML_NATIVE=OFF                          -> identical
+  #   -DGGML_SSE42/AVX/AVX2/FMA/F16C=ON         -> identical (CPU flags apply to all backends)
+  #   -DGGML_CCACHE=OFF                          -> identical
+  #   -DBUILD_SHARED_LIBS=ON                     -> identical
+  #   -DLLAMA_CURL=ON                            -> identical
+  #   -DLLAMA_BUILD_TESTS=OFF                    -> identical
+  # Vulkan-only extras (default OFF, set explicitly for a lean release build):
+  #   -DGGML_VULKAN_DEBUG=OFF
+  #   -DGGML_VULKAN_VALIDATE=OFF    (validation layers add runtime overhead)
+  #   -DGGML_VULKAN_PERF=OFF
+  # No runtime DLLs are bundled: vulkan-1.dll is provided by the GPU driver on
+  # the user's machine, just like the official release.
+  # -----------------------------------------------------------------------------
+  vulkan:
+    name: custom-vulkan (x64, ${{ needs.resolve-ref.outputs.label }})
+    needs: resolve-ref
+    if: inputs.build_backend == 'vulkan' || inputs.build_backend == 'both'
+    runs-on: windows-2022
+
+    steps:
+      - name: Clone llama.cpp (${{ needs.resolve-ref.outputs.label }})
+        uses: actions/checkout@v6
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.resolve-ref.outputs.ref }}
+          fetch-depth: 0
+
+      - name: ccache
+        uses: ggml-org/ccache-action@v1.2.21
+        with:
+          key: custom-vulkan-windows-x64-${{ needs.resolve-ref.outputs.label }}
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          # Resolve the newest SDK version at build time (pinned fallback if endpoint is down).
+          # To pin a specific version instead, set $version directly, e.g. $version = '1.4.357.0'
+          $fallbackVersion = '1.4.357.0'
+          $version = (curl.exe -s https://vulkan.lunarg.com/sdk/latest/windows.txt) -join ''
+          $version = "$version".Trim()
+          if (-not ($version -match '^\d+\.\d+\.\d+\.\d+$')) {
+            Write-Host "Could not resolve latest SDK version ('$version'); using fallback $fallbackVersion"
+            $version = $fallbackVersion
+          }
+          Write-Host "Vulkan SDK version: $version"
+
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          $url = "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe"
+          Write-Host "Downloading Vulkan SDK installer from $url ..."
+          curl.exe -fSL --retry 3 -o $installer $url
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer download failed (exit code $LASTEXITCODE)" }
+
+          Write-Host "Installing Vulkan SDK silently to C:\VulkanSDK ..."
+          # IMPORTANT: since SDK 1.2.189.1 the LunarG Windows installer is built on the
+          # Qt Installer Framework and the old NSIS-style '/S' flag NO LONGER EXISTS.
+          # Passing '/S' makes the installer open its GUI wizard; on a headless GitHub
+          # runner nobody clicks it and the job hangs forever.
+          # Correct silent-install invocation (same as the official llama.cpp workflow):
+          & $installer --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer exited with code $LASTEXITCODE" }
+
+          # Expected install root: C:\VulkanSDK\<version>
+          $sdkPath = "C:\VulkanSDK\$version"
+          if (-not (Test-Path $sdkPath)) {
+            $sdkRoot = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
+                       Sort-Object Name -Descending | Select-Object -First 1
+            if (-not $sdkRoot) {
+              throw "Vulkan SDK install dir not found under C:\VulkanSDK"
+            }
+            $sdkPath = $sdkRoot.FullName
+          }
+          Write-Host "Vulkan SDK root: $sdkPath"
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkPath"
+          Add-Content $env:GITHUB_PATH "$sdkPath\Bin"
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_VULKAN=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            ${{ inputs.vulkan_cmake_flags }}
+          cmake --build build --config Release -j %NUMBER_OF_PROCESSORS% ${{ inputs.build_target && format('--target {0}', inputs.build_target) || '' }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: llama-custom-vulkan-x64-${{ needs.resolve-ref.outputs.label }}
+          path: build/bin/Release/
+          retention-days: 14
