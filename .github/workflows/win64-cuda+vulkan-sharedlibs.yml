@@ -1,0 +1,791 @@
+name: Custom Build (CUDA + Vulkan, Windows)
+
+# -----------------------------------------------------------------------------
+# What this workflow does:
+#   * Daily auto-build (NEW):
+#       - Runs on a schedule (see on.schedule below), resolves the newest
+#         STABLE release of ggml-org/llama.cpp, and compares it with
+#         the tag this workflow built last (state kept in the Actions cache).
+#       - What counts as "stable" (verified against the GitHub API on
+#         2026-11-08): llama.cpp publishes frequent bXXXXX build tags
+#         (b12193, b12202, ...) as PRE-RELEASES, and occasional v<semver>
+#         tags (v0.9.0, v0.10.0, ...) as the stable channel - the /releases
+#         /latest endpoint returns exactly those (newest published,
+#         non-prerelease, non-draft). The nightly resolves ONLY through that
+#         endpoint, with an explicit prerelease/draft rejection as a second
+#         guard, so bXXXXX pre-releases are NEVER auto-built. If the GitHub
+#         API is unreachable, a scheduled run FAILS LOUDLY instead of
+#         guessing a tag via git (git cannot see prerelease flags - the
+#         numerically-largest git tag is always a bXXXXX pre-release) and
+#         retries automatically the next day.
+#       - New tag  -> the CUDA backend is built automatically (nightly
+#         defaults: CUDA 12.4, x64 — see the SCHEDULE_* env vars below).
+#       - Same tag -> the build jobs are skipped; the run stays green and
+#         finishes in about a minute.
+#       - State lost?    As a second line of defense the daily run also lists
+#         this repo's existing build artifacts: a non-expired artifact for
+#         the latest stable tag + the nightly CUDA config also counts as
+#         "already built" and is skipped as well.
+#       - Failed CUDA build -> the state is not updated, so the next daily
+#         run retries the build automatically.
+#       - Scheduled workflows run on the default branch only, and GitHub
+#         disables them after 60 days without repo activity (any commit
+#         re-enables the schedule).
+#   * Optimizations (2026-11, aligned with upstream llama.cpp CI practices):
+#       - Job timeouts on every job (GitHub best practice; a hung Windows
+#         job would otherwise burn up to 6 h of 2x-priced Windows minutes).
+#       - The CUDA toolkit is cached with actions/cache (upstream caches its
+#         OpenVINO toolkit the same way): skips ~1 GB of NVIDIA redist
+#         downloads + unzip + xcopy on every build and masks download flakiness.
+#       - Removed the dead ccache steps: the default cmake flags pass
+#         -DGGML_CCACHE=OFF, so nothing ever went through ccache (the old
+#         key also included the tag, which forced a cold cache per tag).
+#       - CUDA 12.x builds pin CCCL v3.4.3 like upstream (CTK 12.4 bundles a
+#         too-old CUB; the old GGML_CUDA_CUB_3DOT2 flag no longer exists).
+#       - Ninja uses N-1 jobs (upstream parity; CUDA compiles are memory
+#         hungry on 4-core runners).
+#       - cuda_version options now match what llama.cpp's windows-setup-cuda
+#         action actually installs (11.7 / 12.4 / 13.1 / 13.5 as of writing);
+#         unsupported values silently skip the install and fail the build.
+#   * Supply-chain hardening - every `uses:` is pinned to a commit SHA:
+#       All third-party code this workflow executes (the GitHub-owned
+#       actions AND the llama.cpp windows-setup-cuda composite action) is
+#       referenced by an immutable 40-hex commit SHA, never by a movable
+#       tag (@v6) or branch (@master).
+#         Why: a tag or branch is just a movable pointer. The maintainer - or
+#         an attacker who compromises the action's repo - can retarget it, and
+#         your very next run then silently executes different code with your
+#         GITHUB_TOKEN and secrets (this actually happened in the March 2025
+#         tj-actions/changed-files incident: all version tags were rewritten
+#         to a commit that dumped runner memory, secrets included, into public
+#         CI logs; only SHA-pinned repos were unaffected). A commit SHA, by
+#         contrast, addresses content, not a pointer: the code you audited is
+#         the code that runs - forever, until you change it.
+#         The "# vX.Y.Z" comment after each SHA is ignored by GitHub. It is a
+#         human-readable version note, and Dependabot rewrites it when it
+#         bumps the pin.
+#         How to update a pinned action (two options):
+#           1. Dependabot (recommended): copy the delivered dependabot.yml to
+#              .github/dependabot.yml in your repo. Every week it opens PRs
+#              like "Bump actions/checkout from d23441a to <new sha>" that
+#              swap the SHA + version comment. Merge after a green run - now
+#              every action update is a reviewed change, not a silent drift.
+#           2. Manually, e.g. for actions/checkout:
+#                git ls-remote --tags https://github.com/actions/checkout.git 'refs/tags/v6*'
+#              Copy the 40-hex SHA of the tag you want. Prefer a tag WITHOUT
+#              a separate "^{}" line (lightweight tag - the SHA IS the commit);
+#              for annotated tags use the SHA from the "refs/tags/X^{}" line
+#              (that is the commit the tag peels down to). Replace the old SHA
+#              and update the version comment next to it.
+#         Special case - ggml-org/llama.cpp/.github/actions/windows-setup-cuda:
+#           pinned to a specific llama.cpp master commit (comment next to the
+#           step). Upstream evolves it whenever new CUDA toolkit versions gain
+#           support, so bump the pin deliberately when you want that, and
+#           re-check which cuda_version values the new commit installs.
+#           Dependabot does NOT touch this pin (excluded in dependabot.yml) -
+#           see the step comment for the exact bump procedure.
+#   * Repo prerequisite (Settings -> Actions -> General -> Actions permissions):
+#       If this repository uses "Allow <owner>, and select non-<owner>, actions
+#       and reusable workflows" (instead of "Allow all actions"), the allow
+#       list must cover every `uses:` above, or jobs die at the first blocked
+#       step with an "action not in the allow list" failure:
+#         - actions/checkout, actions/cache (+restore/save), actions/upload-artifact
+#           -> tick "Allow actions created by GitHub" (covers the whole
+#              `actions` and `github` orgs), or add pattern: actions/*
+#         - ggml-org/llama.cpp/.github/actions/windows-setup-cuda@<sha>
+#           -> add pattern: ggml-org/llama.cpp@*
+#       Notes: for actions the allow list matches the REPOSITORY (the path
+#       inside it is ignored) and @* matches any ref, including SHA pins, so
+#       Dependabot's SHA bumps never require touching the allow list. The list
+#       gates `uses:` resolution ONLY - it never blocks schedule or
+#       workflow_dispatch triggers, and it never applied to Dependabot itself
+#       (Dependabot is a GitHub service, not an Action; its PRs appear
+#       regardless of this setting).
+#   * Lets you pick the llama.cpp source (manual runs):
+#       - bleeding-edge  : master branch (latest commit)
+#       - latest-tag     : automatically resolves the newest release tag at build time
+#       - custom-tag     : use the tag/commit you type into `llama_tag`
+#       - <tag> (date)   : a pre-populated list of recent releases (refresh periodically)
+#   * Lets you pick the backend:
+#       - cuda           : CUDA build (x64 or arm64, MMQ + ALL_QUANTS)
+#       - vulkan         : Vulkan build (x64 only, based on the official llama.cpp workflow)
+#       - both           : build both backends in parallel
+# -----------------------------------------------------------------------------
+
+on:
+  # Daily check of ggml-org/llama.cpp for a new stable release; builds the
+  # CUDA backend automatically when the release tag changed.
+  # GitHub cron is UTC: 03:00 UTC = 06:00 Europe/Moscow. Runs can start a few
+  # minutes late under load. Only executes on the default branch.
+  schedule:
+    - cron: '0 3 * * *'
+
+  workflow_dispatch:
+    inputs:
+      llama_source:
+        description: 'What to build? bleeding-edge = master branch (latest commit); latest-tag = auto-fetch the newest release tag at build time; custom-tag = use the tag/branch/commit you enter in llama_tag below.'
+        type: choice
+        options:
+          - 'bleeding-edge (master, latest commit)'
+          - 'latest-tag (auto-fetch newest release at build time)'
+          - 'custom-tag (enter tag in llama_tag below)'
+        default: 'bleeding-edge (master, latest commit)'
+      llama_tag:
+        description: 'Used only when llama_source = custom-tag. Any tag, branch or commit SHA from https://github.com/ggml-org/llama.cpp/releases — e.g. b11552, b11500, master, 0a1b2c3d. Browse the releases page to find the tag/date you want, then paste the tag here. Ignored for the other two llama_source modes.'
+        required: false
+        default: ''
+      build_backend:
+        description: 'Backend to build. Vulkan is x64-only; CUDA supports x64 and arm64.'
+        type: choice
+        options:
+          - 'cuda'
+          - 'vulkan'
+          - 'both'
+        default: 'cuda'
+      cuda_version:
+        description: 'CUDA toolkit version (CUDA backend only). Must be a version supported by the llama.cpp windows-setup-cuda action pinned below (11.7 / 12.4 / 13.1 / 13.5 as of the pinned 2026-11-08 commit) - unsupported values silently skip the toolkit install and fail the build.'
+        type: choice
+        options: ['12.4', '13.1', '13.5']
+        default: '12.4'
+      arch:
+        description: 'Target architecture (CUDA only; Vulkan always builds x64)'
+        type: choice
+        options: ['x64', 'arm64']
+        default: 'x64'
+      cuda_cmake_flags:
+        description: 'Extra CMake flags for CUDA build (appended last = override built-ins)'
+        required: false
+        default: '-DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_FORCE_MMQ=ON -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_CCACHE=OFF -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=ON -DLLAMA_BUILD_TESTS=OFF'
+      vulkan_cmake_flags:
+        description: 'CMake flags for Vulkan build. Mirrors cuda_cmake_flags where applicable: -DGGML_CUDA=ON -> -DGGML_VULKAN=ON; -DGGML_CUDA_FA_ALL_QUANTS=ON -> -DGGML_VULKAN_FA_ALL_QUANTS=ON; -DCMAKE_CUDA_ARCHITECTURES and -DGGML_CUDA_FORCE_MMQ have no Vulkan analog (SPIR-V is JIT at runtime; no MMQ kernel). All CPU/build flags (Release, NATIVE=OFF, SSE42/AVX/AVX2/FMA/F16C, CCACHE=OFF, SHARED_LIBS, CURL, NO_TESTS) are identical and included. Vulkan-only extras: explicit VULKAN_DEBUG/VALIDATE/PERF=OFF for a lean release build.'
+        required: false
+        default: '-DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_VULKAN_FA_ALL_QUANTS=ON -DGGML_VULKAN_DEBUG=OFF -DGGML_VULKAN_VALIDATE=OFF -DGGML_VULKAN_PERF=OFF -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_CCACHE=OFF -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=ON -DLLAMA_BUILD_TESTS=OFF'
+      build_target:
+        description: 'Build target (empty = all binaries)'
+        required: false
+        default: ''
+
+# -----------------------------------------------------------------------------
+# Nightly auto-build configuration (used ONLY by the scheduled runs; manual
+# workflow_dispatch runs use the input defaults above). The last-built-tag
+# state cache key is derived from SCHEDULE_CUDA_VERSION + SCHEDULE_ARCH, so
+# changing these makes the nightly run build the new configuration once and
+# then dedup against that configuration going forward.
+# -----------------------------------------------------------------------------
+env:
+  SCHEDULE_BUILD_BACKEND: cuda # nightly auto-build is CUDA-only
+  SCHEDULE_CUDA_VERSION: '12.4'
+  SCHEDULE_ARCH: x64
+
+# The daily dedup saves/restores a tiny state file through the Actions cache,
+# which needs the `actions` write permission on repos whose default
+# GITHUB_TOKEN permissions are restricted. Nothing else is written.
+permissions:
+  contents: read
+  actions: write
+
+# Don't let a scheduled run and a manual run pile up on the same branch: the
+# later run waits for the earlier one to finish; nothing gets cancelled.
+concurrency:
+  group: custom-build-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+
+  # -----------------------------------------------------------------------------
+  # Resolve the llama.cpp git ref from the selected source, normalize the
+  # build parameters (scheduled runs have no dispatch inputs and fall back to
+  # the SCHEDULE_* env defaults), and decide whether the daily auto-build
+  # needs to run at all (release tag changed since the last successful build).
+  # Outputs:
+  #   ref                : the actual git ref to checkout (master, bXXXXX, commit SHA, ...)
+  #   label              : a human-readable label for log lines and artifact names
+  #   should_build       : 'false' for a scheduled run whose tag was already
+  #                        built (state-file match, or an existing non-expired
+  #                        build artifact in this repo) -> the build jobs skip
+  #   update_state       : 'true' when this run should record its tag as the
+  #                        last-built one (scheduled runs, and manual
+  #                        latest-tag runs that include the CUDA backend)
+  #   build_backend      : cuda / vulkan / both (normalized)
+  #   cuda_version       : CUDA toolkit version (normalized)
+  #   arch               : x64 / arm64 (normalized)
+  #   cuda_cmake_flags   : CUDA CMake flags (normalized)
+  #   vulkan_cmake_flags : Vulkan CMake flags (normalized)
+  #   build_target       : build target, empty = all binaries
+  # -----------------------------------------------------------------------------
+  resolve-ref:
+    name: Resolve llama.cpp ref
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      ref: ${{ steps.parse.outputs.ref }}
+      label: ${{ steps.parse.outputs.label }}
+      should_build: ${{ steps.parse.outputs.should_build }}
+      update_state: ${{ steps.parse.outputs.update_state }}
+      build_backend: ${{ steps.parse.outputs.build_backend }}
+      cuda_version: ${{ steps.parse.outputs.cuda_version }}
+      arch: ${{ steps.parse.outputs.arch }}
+      cuda_cmake_flags: ${{ steps.parse.outputs.cuda_cmake_flags }}
+      vulkan_cmake_flags: ${{ steps.parse.outputs.vulkan_cmake_flags }}
+      build_target: ${{ steps.parse.outputs.build_target }}
+    steps:
+      - name: Restore last-built-tag state (daily auto-build dedup)
+        # Tiny state file remembering which llama.cpp tag was last built with
+        # this CUDA configuration. The exact key is never written (saves below
+        # append a unique run suffix), so the restore-keys prefix match picks
+        # the most recent entry. A cache miss just means "not built yet".
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: llama-build-state
+          key: llama-cuda-lastbuilt-v1-${{ env.SCHEDULE_CUDA_VERSION }}-${{ env.SCHEDULE_ARCH }}
+          restore-keys: |
+            llama-cuda-lastbuilt-v1-${{ env.SCHEDULE_CUDA_VERSION }}-${{ env.SCHEDULE_ARCH }}
+
+      - id: parse
+        shell: bash
+        env:
+          # Used ONLY to list this repo's build artifacts (actions: read)
+          # for the "already built?" fallback check.
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -eu
+
+          event="${GITHUB_EVENT_NAME:-}"
+
+          # Scheduled runs carry no workflow_dispatch inputs: force the
+          # "latest stable release" mode. Manual runs use the user's choice.
+          if [ "$event" = "schedule" ]; then
+            src="latest-tag"
+          else
+            src="${{ inputs.llama_source }}"
+          fi
+
+          latest_tag_mode="no"
+
+          case "$src" in
+            bleeding-edge*)
+              ref="master"
+              label="bleeding-edge"
+              ;;
+            latest-tag*)
+              echo "Fetching latest STABLE release tag from the GitHub API..."
+              # llama.cpp release model (verified 2026-11-08): frequent bXXXXX
+              # tags are published as PRE-RELEASES; occasional v<semver> tags
+              # (v0.9.0, v0.10.0, ...) are the stable channel. /releases/latest
+              # returns only the newest published non-prerelease non-draft
+              # release; the python filter below rejects prerelease/draft AGAIN
+              # as a second guard (e.g. against an admin manually marking a
+              # pre-release as "latest"). bXXXXX tags therefore NEVER resolve
+              # through this path.
+              # The call is authenticated with the job's GITHUB_TOKEN when set:
+              # 5000 req/h instead of ~60 req/h unauthenticated, which makes
+              # rate-limit failures effectively impossible on GitHub runners.
+              auth_args=()
+              if [ -n "${GH_TOKEN:-}" ]; then
+                auth_args=(-H "Authorization: Bearer ${GH_TOKEN}")
+              fi
+              ref=""
+              for i in 1 2 3; do
+                echo "API attempt $i ..."
+                if ref="$(curl -fsSL --retry 2 "${auth_args[@]}" -H 'Accept: application/vnd.github+json' \
+                  https://api.github.com/repos/ggml-org/llama.cpp/releases/latest \
+                  | python3 -c 'import sys,json; r=json.load(sys.stdin); sys.exit(1) if (r.get("prerelease") or r.get("draft") or not r.get("tag_name")) else print(r["tag_name"])' 2>/dev/null)" \
+                   && [ -n "$ref" ]; then
+                  break
+                fi
+                ref=""
+                echo "Attempt $i failed (rate limit, transient network error, or the response was a pre-release/draft); retrying in ${API_RETRY_SLEEP:-10}s ..."
+                sleep "${API_RETRY_SLEEP:-10}"
+              done
+              # Fallback ONLY for manual runs. git cannot see GitHub's
+              # prerelease/draft flags, so a git-only "latest tag" is a GUESS:
+              # prefer stable v<semver> tags, and only take a bXXXXX tag when
+              # no v-tag exists at all (bXXXXX are pre-releases). Scheduled
+              # runs never guess - they fail loudly and retry the next day,
+              # which is the safe direction for "stable releases only".
+              if [ -z "$ref" ]; then
+                if [ "$event" = "schedule" ]; then
+                  echo "::error::GitHub API unavailable on a scheduled run. Refusing to guess the latest stable release via git (prerelease status is invisible to git, and llama.cpp's bXXXXX tags are pre-releases). This run does nothing; the next daily run retries automatically." >&2
+                  exit 1
+                fi
+                echo "::warning::GitHub API unavailable (manual run): resolving the newest tag via git ls-remote WITHOUT prerelease/draft verification. Preferring stable v<semver> tags; bXXXXX tags are pre-releases."
+                ref="$(git ls-remote --tags --refs https://github.com/ggml-org/llama.cpp.git \
+                  | sed -nE 's#.*refs/tags/(v[0-9]+(\.[0-9]+)*)$#\1#p' \
+                  | sort -V | tail -n1)"
+                if [ -z "$ref" ]; then
+                  ref="$(git ls-remote --tags --refs https://github.com/ggml-org/llama.cpp.git \
+                    | sed -nE 's#.*refs/tags/(b[0-9]+)$#\1#p' \
+                    | sort -V | tail -n1)"
+                fi
+              fi
+              if [ -z "$ref" ]; then
+                echo "::error::Could not resolve the latest llama.cpp release tag (GitHub API and git ls-remote both failed). Re-run the workflow or use bleeding-edge/custom-tag instead." >&2
+                exit 1
+              fi
+              label="latest-tag($ref)"
+              latest_tag_mode="yes"
+              ;;
+            custom-tag*)
+              ref="${{ inputs.llama_tag }}"
+              if [ -z "$ref" ]; then
+                echo "::error::llama_source=custom-tag but llama_tag is empty. Set llama_tag (browse https://github.com/ggml-org/llama.cpp/releases) or pick a different source." >&2
+                exit 1
+              fi
+              label="custom($ref)"
+              ;;
+            "")
+              # inputs.* is empty when the workflow is triggered by push/PR instead of
+              # workflow_dispatch: default to the same behavior as bleeding-edge instead
+              # of failing and skipping every dependent job.
+              echo "::warning::llama_source is empty (non-dispatch trigger or re-run without inputs); defaulting to bleeding-edge (master)."
+              ref="master"
+              label="bleeding-edge"
+              ;;
+            *)
+              echo "::error::Unknown llama_source value: '$src'. Expected bleeding-edge / latest-tag / custom-tag." >&2
+              exit 1
+              ;;
+          esac
+
+          # ---------------------------------------------------------------------------
+          # Effective build parameters.
+          # Scheduled runs (and any other non-dispatch trigger) have empty
+          # inputs.*, so fall back to the SCHEDULE_* env vars / the same
+          # defaults the workflow_dispatch inputs declare. Keep the flag
+          # strings in sync with the input defaults at the top of this file.
+          # ---------------------------------------------------------------------------
+          build_backend="${{ inputs.build_backend }}"
+          cuda_version="${{ inputs.cuda_version }}"
+          arch="${{ inputs.arch }}"
+          cuda_cmake_flags="${{ inputs.cuda_cmake_flags }}"
+          vulkan_cmake_flags="${{ inputs.vulkan_cmake_flags }}"
+          build_target="${{ inputs.build_target }}"
+
+          if [ "$event" = "schedule" ]; then
+            build_backend="$SCHEDULE_BUILD_BACKEND"
+            cuda_version="$SCHEDULE_CUDA_VERSION"
+            arch="$SCHEDULE_ARCH"
+          fi
+
+          if [ -z "$build_backend" ]; then build_backend="cuda"; fi
+          if [ -z "$cuda_version" ]; then cuda_version="12.4"; fi
+          if [ -z "$arch" ]; then arch="x64"; fi
+          if [ -z "$cuda_cmake_flags" ]; then
+            cuda_cmake_flags="-DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=75 -DGGML_CUDA_FA_ALL_QUANTS=ON -DGGML_CUDA_FORCE_MMQ=ON -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_CCACHE=OFF -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=ON -DLLAMA_BUILD_TESTS=OFF"
+          fi
+          if [ -z "$vulkan_cmake_flags" ]; then
+            vulkan_cmake_flags="-DCMAKE_BUILD_TYPE=Release -DGGML_VULKAN=ON -DGGML_VULKAN_FA_ALL_QUANTS=ON -DGGML_VULKAN_DEBUG=OFF -DGGML_VULKAN_VALIDATE=OFF -DGGML_VULKAN_PERF=OFF -DGGML_NATIVE=OFF -DGGML_SSE42=ON -DGGML_AVX=ON -DGGML_AVX2=ON -DGGML_FMA=ON -DGGML_F16C=ON -DGGML_CCACHE=OFF -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=ON -DLLAMA_BUILD_TESTS=OFF"
+          fi
+          # build_target stays empty when unset = build all binaries.
+
+          # ---------------------------------------------------------------------------
+          # Daily dedup ("already built -> do not rebuild"): skip the build when
+          # the resolved tag was already built, in two ways:
+          #   1. State file (restored from the Actions cache above) names the
+          #      last tag built with this CUDA configuration.
+          #   2. Fallback for lost state (cache evicted / cleared / workflow was
+          #      disabled for a while): list this repo's build artifacts and
+          #      treat the release as built when a non-expired artifact for
+          #      this exact tag + CUDA config exists. Matching also tolerates
+          #      artifact-name sanitization by comparing alphanumeric-only
+          #      forms of the names.
+          # Only scheduled runs dedup; manual runs always build.
+          # ---------------------------------------------------------------------------
+          should_build="true"
+          skip_reason=""
+          last=""
+          if [ -f llama-build-state/last-built-tag.txt ]; then
+            last="$(tr -d '[:space:]' < llama-build-state/last-built-tag.txt)"
+          fi
+
+          if [ "$event" = "schedule" ] && [ -n "$last" ] && [ "$last" = "$ref" ]; then
+            should_build="false"
+            skip_reason="state file: last built tag is already $ref"
+          fi
+
+          if [ "$should_build" = "true" ] && [ "$event" = "schedule" ]; then
+            expected_artifact="llama-custom-cuda-${cuda_version}-${arch}-latest-tag(${ref})"
+            echo "State has no match; checking this repo for an existing artifact: $expected_artifact"
+            art_json="$(curl -fsSL --retry 2 \
+              -H "Authorization: Bearer ${GH_TOKEN:-}" \
+              -H 'Accept: application/vnd.github+json' \
+              "${GITHUB_API_URL:-https://api.github.com}/repos/${GITHUB_REPOSITORY}/actions/artifacts?per_page=100" 2>/dev/null || true)"
+            if [ -n "$art_json" ]; then
+              if printf '%s' "$art_json" | python3 -c 'import sys, json; want = sys.argv[1]; norm = lambda s: "".join(c for c in s if c.isalnum()); wn = norm(want); arts = json.load(sys.stdin).get("artifacts", []); sys.exit(0 if any((a.get("name") == want or norm(a.get("name", "")) == wn) and not a.get("expired", False) for a in arts) else 1)' "$expected_artifact" 2>/dev/null; then
+                should_build="false"
+                skip_reason="existing artifact: $expected_artifact"
+              fi
+            else
+              # Best-effort check: on API failure fall through and build (the
+              # safe direction - the worst case is one redundant build).
+              echo "::warning::Could not list this repo's artifacts; relying on the state file only."
+            fi
+          fi
+
+          # Record state only for runs that (attempt to) build the latest
+          # stable tag with the CUDA backend: scheduled runs, or manual
+          # latest-tag runs whose backend includes CUDA. Manual
+          # bleeding-edge / custom-tag runs never touch the state.
+          update_state="false"
+          if [ "$event" = "schedule" ]; then
+            update_state="true"
+          elif [ "$latest_tag_mode" = "yes" ]; then
+            case "$build_backend" in
+              cuda|both) update_state="true" ;;
+            esac
+          fi
+
+          {
+            echo "ref=$ref"
+            echo "label=$label"
+            echo "should_build=$should_build"
+            echo "update_state=$update_state"
+            echo "build_backend=$build_backend"
+            echo "cuda_version=$cuda_version"
+            echo "arch=$arch"
+            echo "cuda_cmake_flags=$cuda_cmake_flags"
+            echo "vulkan_cmake_flags=$vulkan_cmake_flags"
+            echo "build_target=$build_target"
+          } >> "$GITHUB_OUTPUT"
+
+          echo "Resolved ref: $ref  (label: $label)"
+          echo "Event: $event | backend: $build_backend | CUDA: $cuda_version | arch: $arch"
+          echo "Last built tag: ${last:-<none>} -> should_build=$should_build"
+
+          if [ "$should_build" = "false" ]; then
+            echo "::notice::Stable llama.cpp release $ref has already been built ($skip_reason) - CUDA build skipped."
+          fi
+
+          {
+            echo "## llama.cpp custom build"
+            echo ""
+            echo "- Trigger: $event"
+            echo "- Resolved llama.cpp ref: $ref (label: $label)"
+            echo "- Backend: $build_backend (CUDA $cuda_version, $arch)"
+            echo "- Last built tag: ${last:-<none>}"
+            if [ "$should_build" = "true" ]; then
+              echo "- Decision: build now (new stable release not built yet)"
+            else
+              echo "- Decision: skip - $skip_reason"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+  # -----------------------------------------------------------------------------
+  # CUDA build job. Same build logic as before; the parameters now come from
+  # the normalized resolve-ref outputs so scheduled runs — which have no
+  # dispatch inputs — get the same defaults as manual runs.
+  # -----------------------------------------------------------------------------
+  cuda:
+    name: custom-cuda (${{ needs.resolve-ref.outputs.cuda_version }}, ${{ needs.resolve-ref.outputs.arch }}, ${{ needs.resolve-ref.outputs.label }})
+    needs: resolve-ref
+    if: |
+      (needs.resolve-ref.outputs.build_backend == 'cuda' ||
+       needs.resolve-ref.outputs.build_backend == 'both') &&
+      needs.resolve-ref.outputs.should_build == 'true'
+    runs-on: windows-2022
+    # Full CUDA build of all binaries takes ~45-75 min on a 4-core runner;
+    # 150 min leaves headroom for slow runners without letting a hung job
+    # burn the 6 h default of 2x-priced Windows minutes.
+    timeout-minutes: 150
+
+    steps:
+      - name: Clone llama.cpp (${{ needs.resolve-ref.outputs.label }})
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.resolve-ref.outputs.ref }}
+          # fetch-depth: 0 is required for a correct version string:
+          # cmake/build-info.cmake runs `git rev-list --count HEAD`, which
+          # returns a bogus small number on shallow clones. It costs ~2-3 min
+          # extra on Windows; switch to fetch-depth: 1 if you don't care.
+          fetch-depth: 0
+
+      - name: Cache CUDA toolkit
+        # The llama.cpp setup action re-downloads ~1 GB of CUDA redist zips
+        # on every run (its internal curl has no --retry). Cache the
+        # installed toolkit instead - the same pattern upstream llama.cpp
+        # uses for its OpenVINO toolkit in release.yml. The post-step saves
+        # the directory even if the build later fails.
+        id: cache-cuda
+        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: 'C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ needs.resolve-ref.outputs.cuda_version }}'
+          key: cuda-toolkit-v1-${{ needs.resolve-ref.outputs.cuda_version }}-${{ needs.resolve-ref.outputs.arch }}-windows-2022
+
+      - name: Install Cuda Toolkit
+        if: steps.cache-cuda.outputs.cache-hit != 'true'
+        # Pinned to a specific llama.cpp master commit instead of the floating
+        # @master branch (see "Supply-chain hardening" in the header). This
+        # action decides which CUDA versions can be installed and where the
+        # toolkit lands - the toolkit cache key above depends on that layout.
+        #
+        # How to bump this pin (when you want newer CUDA version support):
+        #   1. Look up the current master commit:
+        #        git ls-remote https://github.com/ggml-org/llama.cpp.git refs/heads/master
+        #   2. Replace the SHA below and update the date comment.
+        #   3. Open .github/actions/windows-setup-cuda/action.yml at that
+        #      commit and check which cuda_version values it installs now
+        #      (each version is one "Install Cuda Toolkit X.Y" step).
+        #   4. Update the cuda_version input options at the top of this file
+        #      to match, and bump the "v1" in the toolkit cache key if the
+        #      install layout changed.
+        #   5. Run once with "custom-tag" to verify the new version installs.
+        # Alternatively pin it to the llama.cpp release tag being built:
+        #   uses: ggml-org/llama.cpp/.github/actions/windows-setup-cuda@${{ needs.resolve-ref.outputs.ref }}
+        # (zero maintenance, but new CUDA versions only become available once
+        #  they are in a released tag - this option trades freshness for zero
+        #  upkeep; pick whichever matters more to you).
+        uses: ggml-org/llama.cpp/.github/actions/windows-setup-cuda@a691b2345844ce1b430201fc5fd404ce062e05f2 # llama.cpp master 2026-11-08 - installs CUDA 11.7 / 12.4 / 13.1 / 13.5
+        with:
+          cuda_version: ${{ needs.resolve-ref.outputs.cuda_version }}
+          cuda_arch: ${{ needs.resolve-ref.outputs.arch }}
+
+      - name: Configure CUDA environment (cached toolkit)
+        # Restore the PATH / CUDA_PATH setup the install action normally does.
+        if: steps.cache-cuda.outputs.cache-hit == 'true'
+        shell: pwsh
+        run: |
+          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ needs.resolve-ref.outputs.cuda_version }}"
+          Add-Content $env:GITHUB_ENV "CUDA_PATH=$cuda"
+          Add-Content $env:GITHUB_PATH "$cuda\bin"
+          Add-Content $env:GITHUB_PATH "$cuda\libnvvp"
+
+      - name: Verify CUDA toolkit
+        # Fail loudly when the setup action silently skipped the requested
+        # version (it only installs 11.7 / 12.4 / 13.1 / 13.5 as of writing)
+        # instead of failing later inside CMake with a confusing error.
+        shell: pwsh
+        run: |
+          $cuda = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ needs.resolve-ref.outputs.cuda_version }}"
+          if (-not (Test-Path "$cuda\bin\nvcc.exe")) {
+            Write-Error "nvcc.exe not found under $cuda. CUDA ${{ needs.resolve-ref.outputs.cuda_version }} is probably not supported by the pinned windows-setup-cuda action - check the action.yml at the pinned commit (see the comment above the install step) or pick a different cuda_version."
+            exit 1
+          }
+          & "$cuda\bin\nvcc.exe" --version | Select-Object -First 4
+
+      # NOTE: the ggml-org/ccache-action step that used to sit here was dead
+      # weight: the default cmake flags pass -DGGML_CCACHE=OFF, so no
+      # compilation ever went through ccache and the cache was never
+      # populated (and the old key included the tag = cold cache per tag).
+      # Removed to save ~1-2 min per run and to stop churning the repo's
+      # 10 GB cache budget. To re-enable ccache: drop -DGGML_CCACHE=OFF from
+      # the flag defaults and add back:
+      #   - name: ccache
+      #     uses: ggml-org/ccache-action@v1.2.24
+      #     with:
+      #       key: custom-cuda-windows-${{ needs.resolve-ref.outputs.cuda_version }}-${{ needs.resolve-ref.outputs.arch }}
+      #       evict-old-files: 1d
+      # (keep the tag OUT of the key, like upstream does)
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Arm64 toolchain flag
+        if: needs.resolve-ref.outputs.arch == 'arm64'
+        shell: bash
+        run: echo "TOOLCHAIN_FLAG=-DCMAKE_TOOLCHAIN_FILE=cmake/arm64-windows-msvc-cuda.cmake" >> "$GITHUB_ENV"
+
+      - name: CUDA 12.x CCCL pin
+        # CTK 12.4 bundles a CCCL/CUB that is too old for current ggml-cuda
+        # code; upstream llama.cpp pins CCCL v3.4.3 for its 12.4 release
+        # builds (CTK >= 13.5 bundles CCCL >= 3.5 and needs no pin). The old
+        # GGML_CUDA_CUB_3DOT2 flag this step used to set no longer exists in
+        # llama.cpp and was silently ignored.
+        if: startsWith(needs.resolve-ref.outputs.cuda_version, '12')
+        shell: bash
+        run: echo "CUDA_COMPAT_FLAG=-DGGML_CUDA_CCCL_VERSION=v3.4.3" >> "$GITHUB_ENV"
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" ${{ needs.resolve-ref.outputs.arch == 'x64' && 'x64' || 'amd64_arm64' }}
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_CUDA=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            ${{ env.TOOLCHAIN_FLAG }} ^
+            ${{ env.CUDA_COMPAT_FLAG }} ^
+            ${{ needs.resolve-ref.outputs.cuda_cmake_flags }}
+          REM Leave one core for the runner/OS - matches upstream llama.cpp CI
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% ${{ needs.resolve-ref.outputs.build_target && format('--target {0}', needs.resolve-ref.outputs.build_target) || '' }}
+
+      - name: Bundle CUDA runtime DLLs
+        shell: pwsh
+        run: |
+          $cudaBin = "C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v${{ needs.resolve-ref.outputs.cuda_version }}\bin"
+          if (Test-Path $cudaBin) {
+            Copy-Item "$cudaBin\cudart64_*.dll","$cudaBin\cublas64_*.dll","$cudaBin\cublasLt64_*.dll" -Destination build/bin/Release -ErrorAction SilentlyContinue
+          }
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: llama-custom-cuda-${{ needs.resolve-ref.outputs.cuda_version }}-${{ needs.resolve-ref.outputs.arch }}-${{ needs.resolve-ref.outputs.label }}
+          path: build/bin/Release/
+          retention-days: 14
+
+  # -----------------------------------------------------------------------------
+  # Vulkan build job (Windows x64 only).
+  # Mirrors the official llama.cpp windows-vulkan-x64 workflow:
+  #   * LunarG Vulkan SDK installed silently to C:\VulkanSDK\<version>
+  #   * VULKAN_SDK env var + Bin on PATH
+  #   * CMake/Ninja Multi-Config + MSVC vcvarsall x64
+  #   * -DGGML_VULKAN=ON
+  #
+  # Flag mapping (CUDA -> Vulkan). Every CUDA flag that has an analog or that
+  # is shared across backends is mirrored here:
+  #   -DCMAKE_BUILD_TYPE=Release                -> identical
+  #   -DGGML_CUDA=ON                            -> -DGGML_VULKAN=ON
+  #   -DCMAKE_CUDA_ARCHITECTURES=75              -> (no analog; Vulkan SPIR-V is JIT'd to GPU arch at runtime)
+  #   -DGGML_CUDA_FA_ALL_QUANTS=ON              -> -DGGML_VULKAN_FA_ALL_QUANTS=ON
+  #   -DGGML_CUDA_FORCE_MMQ=ON                   -> (no analog; MMQ is a CUDA-only kernel)
+  #   -DGGML_NATIVE=OFF                          -> identical
+  #   -DGGML_SSE42/AVX/AVX2/FMA/F16C=ON         -> identical (CPU flags apply to all backends)
+  #   -DGGML_CCACHE=OFF                          -> identical
+  #   -DBUILD_SHARED_LIBS=ON                     -> identical
+  #   -DLLAMA_CURL=ON                            -> identical
+  #   -DLLAMA_BUILD_TESTS=OFF                    -> identical
+  # Vulkan-only extras (default OFF, set explicitly for a lean release build):
+  #   -DGGML_VULKAN_DEBUG=OFF
+  #   -DGGML_VULKAN_VALIDATE=OFF    (validation layers add runtime overhead)
+  #   -DGGML_VULKAN_PERF=OFF
+  # No runtime DLLs are bundled: vulkan-1.dll is provided by the GPU driver on
+  # the user's machine, just like the official release.
+  # NOTE: the daily scheduled run never builds Vulkan (CUDA-only by design);
+  # run the workflow manually with build_backend = vulkan / both for that.
+  # -----------------------------------------------------------------------------
+  vulkan:
+    name: custom-vulkan (x64, ${{ needs.resolve-ref.outputs.label }})
+    needs: resolve-ref
+    if: |
+      (needs.resolve-ref.outputs.build_backend == 'vulkan' ||
+       needs.resolve-ref.outputs.build_backend == 'both') &&
+      needs.resolve-ref.outputs.should_build == 'true'
+    runs-on: windows-2022
+    timeout-minutes: 90
+
+    steps:
+      - name: Clone llama.cpp (${{ needs.resolve-ref.outputs.label }})
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6.1.0
+        with:
+          repository: ggml-org/llama.cpp
+          ref: ${{ needs.resolve-ref.outputs.ref }}
+          fetch-depth: 0
+
+      # NOTE: the ccache step that used to sit here was dead weight - the
+      # default vulkan_cmake_flags pass -DGGML_CCACHE=OFF, so nothing ever
+      # went through ccache. See the note in the CUDA job above for how to
+      # re-enable it properly (tagless key + GGML_CCACHE=ON).
+
+      - name: Install Vulkan SDK
+        shell: pwsh
+        timeout-minutes: 20
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $ProgressPreference = 'SilentlyContinue'
+
+          # Resolve the newest SDK version at build time (pinned fallback if endpoint is down).
+          # To pin a specific version instead, set $version directly, e.g. $version = '1.4.357.0'
+          $fallbackVersion = '1.4.357.0'
+          $version = (curl.exe -s https://vulkan.lunarg.com/sdk/latest/windows.txt) -join ''
+          $version = "$version".Trim()
+          if (-not ($version -match '^\d+\.\d+\.\d+\.\d+$')) {
+            Write-Host "Could not resolve latest SDK version ('$version'); using fallback $fallbackVersion"
+            $version = $fallbackVersion
+          }
+          Write-Host "Vulkan SDK version: $version"
+
+          $installer = "$env:RUNNER_TEMP\VulkanSDK-Installer.exe"
+          $url = "https://sdk.lunarg.com/sdk/download/$version/windows/vulkansdk-windows-X64-$version.exe"
+          Write-Host "Downloading Vulkan SDK installer from $url ..."
+          curl.exe -fSL --retry 3 -o $installer $url
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer download failed (exit code $LASTEXITCODE)" }
+
+          Write-Host "Installing Vulkan SDK silently to C:\VulkanSDK ..."
+          # IMPORTANT: since SDK 1.2.189.1 the LunarG Windows installer is built on the
+          # Qt Installer Framework and the old NSIS-style '/S' flag NO LONGER EXISTS.
+          # Passing '/S' makes the installer open its GUI wizard; on a headless GitHub
+          # runner nobody clicks it and the job hangs forever.
+          # Correct silent-install invocation (same as the official llama.cpp workflow):
+          & $installer --accept-licenses --default-answer --confirm-command install
+          if ($LASTEXITCODE -ne 0) { throw "Vulkan SDK installer exited with code $LASTEXITCODE" }
+
+          # Expected install root: C:\VulkanSDK\<version>
+          $sdkPath = "C:\VulkanSDK\$version"
+          if (-not (Test-Path $sdkPath)) {
+            $sdkRoot = Get-ChildItem 'C:\VulkanSDK' -Directory -ErrorAction SilentlyContinue |
+                       Sort-Object Name -Descending | Select-Object -First 1
+            if (-not $sdkRoot) {
+              throw "Vulkan SDK install dir not found under C:\VulkanSDK"
+            }
+            $sdkPath = $sdkRoot.FullName
+          }
+          Write-Host "Vulkan SDK root: $sdkPath"
+          Add-Content $env:GITHUB_ENV "VULKAN_SDK=$sdkPath"
+          Add-Content $env:GITHUB_PATH "$sdkPath\Bin"
+
+      - name: Install Ninja
+        run: choco install ninja
+
+      - name: Build
+        shell: cmd
+        run: |
+          call "C:\Program Files\Microsoft Visual Studio\2022\Enterprise\VC\Auxiliary\Build\vcvarsall.bat" x64
+          cmake -S . -B build -G "Ninja Multi-Config" ^
+            -DGGML_BACKEND_DL=ON ^
+            -DGGML_NATIVE=OFF ^
+            -DGGML_VULKAN=ON ^
+            -DLLAMA_BUILD_BORINGSSL=ON ^
+            ${{ needs.resolve-ref.outputs.vulkan_cmake_flags }}
+          REM Leave one core for the runner/OS - matches upstream llama.cpp CI
+          set /A NINJA_JOBS=%NUMBER_OF_PROCESSORS%-1
+          cmake --build build --config Release -j %NINJA_JOBS% ${{ needs.resolve-ref.outputs.build_target && format('--target {0}', needs.resolve-ref.outputs.build_target) || '' }}
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: llama-custom-vulkan-x64-${{ needs.resolve-ref.outputs.label }}
+          path: build/bin/Release/
+          retention-days: 14
+
+  # -----------------------------------------------------------------------------
+  # Record the tag that was just built (state for the daily auto-build).
+  # Runs for scheduled runs and for manual latest-tag runs that include the
+  # CUDA backend:
+  #   * CUDA build succeeded        -> state updated to the new tag, so the
+  #     next daily check with the same tag will skip.
+  #   * CUDA build skipped (dupe)   -> the same tag is re-written, which also
+  #     refreshes the cache entry (caches are evicted after 7 days without
+  #     access) and keeps the scheduled run green.
+  #   * CUDA build failed           -> this job is skipped, the state is NOT
+  #     updated, and the next daily run retries the build automatically.
+  # The unique run-id suffix in the save key works around the fact that cache
+  # entries are immutable: every save creates a new entry and the prefix
+  # restore above always finds the most recent one.
+  # -----------------------------------------------------------------------------
+  save-state:
+    name: Record last-built tag
+    needs: [resolve-ref, cuda]
+    if: |
+      always() &&
+      !failure() &&
+      !cancelled() &&
+      needs.resolve-ref.outputs.update_state == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Write state file
+        shell: bash
+        run: |
+          set -eu
+          mkdir -p llama-build-state
+          printf '%s' '${{ needs.resolve-ref.outputs.ref }}' > llama-build-state/last-built-tag.txt
+          echo "Last-built tag recorded: $(cat llama-build-state/last-built-tag.txt)"
+
+      - name: Save state to the Actions cache
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        with:
+          path: llama-build-state
+          key: llama-cuda-lastbuilt-v1-${{ needs.resolve-ref.outputs.cuda_version }}-${{ needs.resolve-ref.outputs.arch }}-${{ github.run_id }}-${{ github.run_attempt }}

@@ -1,0 +1,58 @@
+# -----------------------------------------------------------------------------
+# Dependabot configuration - keeps the SHA-pinned GitHub Actions up to date.
+#
+# PLACE THIS FILE AT:   .github/dependabot.yml
+# (in the same repository as the custom-build workflow; commit it to the
+#  default branch so the schedule takes effect)
+#
+# How it works:
+#   Once a week (Monday 01:00 UTC - before the daily 03:00 UTC build check)
+#   Dependabot scans every workflow file in the repo for `uses:` references,
+#   resolves the newest tag of each referenced action, and opens a PR like:
+#       "Bump actions/checkout from d23441a to <new sha>"
+#   The PR swaps the 40-hex SHA and rewrites the "# vX.Y.Z" version comment
+#   next to it. Merge it after a green workflow run (trigger a manual
+#   workflow_dispatch to test). This turns every action update into a
+#   reviewed change - the whole point of pinning - instead of the silent
+#   drift you get with floating tags like @v6 / @master.
+#
+# Scope:
+#   * UPDATES: the official GitHub-owned actions (actions/checkout,
+#     actions/cache + actions/cache/restore + actions/cache/save,
+#     actions/upload-artifact) - the "actions/*" allow-filter below.
+#   * DOES NOT TOUCH: ggml-org/llama.cpp/.github/actions/windows-setup-cuda.
+#     Upstream moves that action in lockstep with llama.cpp development, so a
+#     new pin only makes sense together with re-checking which cuda_version
+#     values the new commit installs (and possibly bumping the toolkit cache
+#     key). The exact manual bump procedure is documented in the comment
+#     above that step in the workflow file.
+#
+# For the full option reference see:
+#   https://docs.github.com/en/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+# -----------------------------------------------------------------------------
+version: 2
+
+updates:
+  - package-ecosystem: "github-actions"
+    # "/" = scan workflow files at the repo root and under .github/workflows/
+    directory: "/"
+
+    schedule:
+      interval: "weekly"
+      day: "monday"
+      time: "01:00"
+      timezone: "UTC"
+
+    # Only the official GitHub-owned actions; the ggml-org/llama.cpp pin in
+    # the workflow stays manual on purpose (see "Scope" above). Wildcards are
+    # supported in dependency names.
+    allow:
+      - dependency-name: "actions/*"
+
+    labels:
+      - "ci"
+      - "dependencies"
+
+    commit-message:
+      prefix: "ci"
+      include: "scope"
